@@ -1,0 +1,12 @@
+*.bin
+*.pth
+*.safetensors
+*.zip
+outputs/
+logs/
+data/train/
+data/test/
+__pycache__/
+*.pyc
+.idea/
+.vscode/

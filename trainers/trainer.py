@@ -32,6 +32,7 @@ from .lr_scheduler import build_scheduler
 from losses.ema_teacher import EMATeacher
 from losses.noise_filter import GMMSampleSelector, CoRefinementModule
 from losses.supcon import NoiseRobustSupConLoss
+from losses.co_teaching import CoTeachingSelector, CoTeachingLoss
 
 
 class Trainer:
@@ -153,6 +154,47 @@ class Trainer:
         else:
             self.supcon_loss = None
 
+        # --- Co-Teaching (dual network) ---
+        self.use_co_teaching = config.loss.use_co_teaching
+        if self.use_co_teaching:
+            import copy
+            self.model_b = copy.deepcopy(self.model)
+            # Different initialization for B
+            for param_b in self.model_b.parameters():
+                if param_b.requires_grad:
+                    nn.init.normal_(param_b.data, std=0.001)
+
+            self.optimizer_b = self._build_optimizer_for_model(self.model_b)
+            self.scheduler_b = build_scheduler(
+                self.optimizer_b,
+                scheduler_type=config.train.lr_scheduler,
+                warmup_epochs=config.train.warmup_epochs,
+                total_epochs=config.train.epochs,
+                warmup_lr=config.train.warmup_lr,
+                min_lr=config.train.min_lr,
+                steps_per_epoch=len(train_loader) // config.train.gradient_accumulation_steps,
+            )
+
+            # Reuse criterion but create separate instance for model B
+            # (if ELR-based, need separate EMA targets)
+            self.criterion_b = copy.deepcopy(criterion)
+
+            self.co_teach_selector = CoTeachingSelector(
+                forget_rate=config.loss.co_teach_forget_rate,
+                num_gradual=config.loss.co_teach_num_gradual,
+                num_classes=config.model.num_classes,
+            )
+            self.co_teach_loss = CoTeachingLoss(
+                self.criterion, self.criterion_b, self.co_teach_selector
+            )
+            self.model_b = self.model_b.to(self.device)
+            print(f"[Trainer] Co-Teaching enabled: forget_rate={config.loss.co_teach_forget_rate}")
+        else:
+            self.model_b = None
+            self.optimizer_b = None
+            self.criterion_b = None
+            self.co_teach_loss = None
+
         # Output paths
         self.output_dir = Path(config.output_dir) / config.exp_name
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -195,16 +237,18 @@ class Trainer:
 
     def _build_optimizer(self):
         """Build optimizer with per-parameter learning rates."""
+        return self._build_optimizer_for_model(self.model)
+
+    def _build_optimizer_for_model(self, model):
         cfg = self.config.train
 
-        # Group parameters by LR multiplier
         backbone_params = []
         lora_params = []
         head_params = []
         prompt_params = []
         other_params = []
 
-        for name, param in self.model.named_parameters():
+        for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
             if "lora_A" in name or "lora_B" in name:
@@ -241,7 +285,7 @@ class Trainer:
         if prompt_params:
             param_groups.append({
                 "params": prompt_params,
-                "lr": cfg.lr * 0.5,  # Prompt learner uses half LR for stability
+                "lr": cfg.lr * 0.5,
                 "name": "prompt",
             })
         if other_params:
@@ -294,7 +338,10 @@ class Trainer:
             self.current_epoch = epoch
 
             # Train one epoch
-            train_loss = self._train_epoch(epoch)
+            if self.use_co_teaching:
+                train_loss = self._train_epoch_coteach(epoch)
+            else:
+                train_loss = self._train_epoch(epoch)
             self.train_losses.append(train_loss)
 
             # Full GMM update at epoch level (after worst samples stabilized)
@@ -562,6 +609,81 @@ class Trainer:
 
         return total_loss / max(num_batches, 1)
 
+    def _train_epoch_coteach(self, epoch: int) -> float:
+        """Co-Teaching epoch: two models select clean samples for each other."""
+        self.model.train()
+        self.model_b.train()
+        cfg = self.config.train
+
+        total_loss = 0.0
+        num_batches = 0
+        self.optimizer.zero_grad()
+        self.optimizer_b.zero_grad()
+
+        pbar = tqdm(self.train_loader, desc=f"CoTeach Epoch {epoch + 1}/{cfg.epochs}", leave=False)
+
+        for batch_idx, batch in enumerate(pbar):
+            images, labels, indices = batch
+            images = images.to(self.device)
+            indices = indices.to(self.device)
+            is_soft = (labels.dtype in (torch.float16, torch.float32, torch.float64) and labels.dim() > 1)
+            labels = labels.to(self.device)
+
+            with torch.amp.autocast("cuda", enabled=self.use_amp):
+                # Forward both models
+                logits_a = self.model(images)
+                logits_b = self.model_b(images)
+
+                # Co-Teaching: each model selects clean samples for the other
+                ct_result = self.co_teach_loss.compute_losses(
+                    indices, logits_a, logits_b, labels, epoch
+                )
+
+                loss = (ct_result["loss_a"] + ct_result["loss_b"]) / 2
+                loss = loss / cfg.gradient_accumulation_steps
+
+            # Backward model A
+            self.scaler.scale(ct_result["loss_a"] / cfg.gradient_accumulation_steps).backward(retain_graph=True)
+            # Backward model B
+            self.scaler.scale(ct_result["loss_b"] / cfg.gradient_accumulation_steps).backward()
+
+            # Gradient step for both
+            if (batch_idx + 1) % cfg.gradient_accumulation_steps == 0:
+                for opt in [self.optimizer, self.optimizer_b]:
+                    self.scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(self.model_b.parameters(), cfg.max_grad_norm)
+                    self.scaler.step(opt)
+
+                self.scaler.update()
+                self.optimizer.zero_grad()
+                self.optimizer_b.zero_grad()
+
+                if self.scheduler_is_per_batch:
+                    self.scheduler.step()
+                    self.scheduler_b.step()
+
+            total_loss += loss.item() * cfg.gradient_accumulation_steps
+            num_batches += 1
+            self.global_step += 1
+
+            pbar.set_postfix({
+                "loss": f"{loss.item() * cfg.gradient_accumulation_steps:.4f}",
+                "R": f"{ct_result['remember_rate']:.2f}",
+                "cla": f"{ct_result['clean_ratio_a']:.2f}",
+                "clb": f"{ct_result['clean_ratio_b']:.2f}",
+            })
+
+        # Epoch-level scheduler step
+        if not self.scheduler_is_per_batch:
+            for sched in [self.scheduler, self.scheduler_b]:
+                if cfg.lr_scheduler == "plateau":
+                    pass  # Will be called by caller
+                elif cfg.lr_scheduler != "onecycle":
+                    sched.step()
+
+        return total_loss / max(num_batches, 1)
+
     def _compute_main_loss(
         self,
         indices: torch.Tensor,
@@ -608,6 +730,13 @@ class Trainer:
             "train_losses": self.train_losses,
             "val_accs": self.val_accs,
         }
+
+        # Save Co-Teaching model B
+        if self.model_b is not None:
+            checkpoint["model_b_state_dict"] = self.model_b.state_dict()
+            checkpoint["optimizer_b_state_dict"] = self.optimizer_b.state_dict()
+            if self.scheduler_b:
+                checkpoint["scheduler_b_state_dict"] = self.scheduler_b.state_dict()
 
         # Save EMA teacher
         if self.ema_teacher:

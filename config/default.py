@@ -105,6 +105,11 @@ class LossConfig:
     refine_alpha: float = 0.5  # Initial trust in model predictions
     refine_max_alpha: float = 0.9  # Maximum trust in model predictions
 
+    # --- Co-Teaching (dual-network mutual sample selection) ---
+    use_co_teaching: bool = False  # Two networks select clean samples for each other
+    co_teach_forget_rate: float = 0.3  # Final fraction of samples to forget
+    co_teach_num_gradual: int = 10  # Epochs over which to decay remember rate
+
 
 @dataclass
 class TrainConfig:

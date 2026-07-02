@@ -52,6 +52,7 @@ def get_train_transforms(
     aug_list.extend([
         transforms.ToTensor(),
         transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD),
+        transforms.RandomErasing(p=0.25, scale=(0.02, 0.1), ratio=(0.3, 3.3)),
     ])
 
     return transforms.Compose(aug_list)
@@ -100,8 +101,12 @@ class MixUpCutMixCollator:
     """
     Batch collator that applies MixUp and/or CutMix to training batches.
 
-    These augmentations create interpolated samples and soft labels,
-    providing strong regularization against label noise.
+    Supports two modes:
+    - keep_hard_labels=False (default): Standard MixUp/CutMix with soft labels.
+      Best for GCE/CE loss but NOT compatible with ELR's per-sample EMA targets.
+    - keep_hard_labels=True: Apply MixUp/CutMix to images only, keep original
+      hard labels. Compatible with ELR. Still provides strong image-space
+      regularization by creating interpolated/augmented images.
     """
 
     def __init__(
@@ -112,6 +117,8 @@ class MixUpCutMixCollator:
         label_smoothing: float = 0.1,
         use_mixup: bool = True,
         use_cutmix: bool = True,
+        keep_hard_labels: bool = True,
+        mix_prob: float = 0.5,
     ):
         self.num_classes = num_classes
         self.mixup_alpha = mixup_alpha
@@ -119,6 +126,8 @@ class MixUpCutMixCollator:
         self.label_smoothing = label_smoothing
         self.use_mixup = use_mixup
         self.use_cutmix = use_cutmix
+        self.keep_hard_labels = keep_hard_labels
+        self.mix_prob = mix_prob
 
     def __call__(self, batch):
         images, labels, indices = zip(*batch)
@@ -127,6 +136,10 @@ class MixUpCutMixCollator:
         indices = torch.tensor(indices)
 
         if not self.use_mixup and not self.use_cutmix:
+            return images, labels, indices
+
+        # Only apply mixing with probability mix_prob
+        if torch.rand(1).item() > self.mix_prob:
             return images, labels, indices
 
         # Decide between mixup and cutmix
@@ -143,7 +156,7 @@ class MixUpCutMixCollator:
         return images, labels, indices
 
     def _mixup(self, images, labels):
-        """Apply MixUp: x' = λ*x_i + (1-λ)*x_j, y' = λ*y_i + (1-λ)*y_j"""
+        """Apply MixUp: x' = λ*x_i + (1-λ)*x_j."""
         lam = float(
             torch.distributions.Beta(self.mixup_alpha, self.mixup_alpha).sample()
         )
@@ -154,7 +167,12 @@ class MixUpCutMixCollator:
 
         mixed_images = lam * images + (1 - lam) * images[index]
 
-        # Convert to one-hot for mixing
+        if self.keep_hard_labels:
+            # Keep original hard labels for ELR compatibility
+            # Image mixing alone provides strong regularization
+            return mixed_images, labels
+
+        # Soft labels: standard MixUp
         labels_onehot = torch.zeros(
             batch_size, self.num_classes, device=images.device
         )
@@ -167,7 +185,6 @@ class MixUpCutMixCollator:
 
         mixed_labels = lam * labels_onehot + (1 - lam) * labels_onehot_b
 
-        # Apply label smoothing on top
         if self.label_smoothing > 0:
             mixed_labels = (
                 mixed_labels * (1 - self.label_smoothing)
@@ -202,6 +219,10 @@ class MixUpCutMixCollator:
         # Apply cutmix
         mixed_images = images.clone()
         mixed_images[:, :, y1:y2, x1:x2] = images[index, :, y1:y2, x1:x2]
+
+        if self.keep_hard_labels:
+            # Keep original hard labels for ELR compatibility
+            return mixed_images, labels
 
         # Adjust lambda to actual area ratio
         lam = 1 - ((x2 - x1) * (y2 - y1) / (W * H))

@@ -142,7 +142,7 @@ def apply_lora_to_clip(
         Model with LoRA applied (same model, modified in-place)
     """
     if target_modules is None:
-        target_modules = ["q_proj", "v_proj", "k_proj", "out_proj"]
+        target_modules = ["q_proj", "v_proj", "k_proj", "out_proj", "c_fc", "c_proj", "fc1", "fc2"]
 
     lora_count = 0
 

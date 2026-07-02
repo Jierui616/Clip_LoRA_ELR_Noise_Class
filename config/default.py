@@ -15,30 +15,31 @@ class ModelConfig:
 
     # --- CLIP backbone ---
     clip_model: str = "ViT-B-32"
-    pretrained: str = "openai"  # openai | laion2b_s34b_b79k
+    pretrained: str = "openai"  # openai | laion2b_s34b_b79k | or local path
+    pretrained_local: str = "./data/ViT-B-32_openai.bin"  # Local weights (fallback if HF blocked)
     freeze_backbone: bool = True  # Freeze CLIP backbone weights
     image_size: int = 224
 
     # --- LoRA ---
-    lora_r: int = 16  # LoRA rank
-    lora_alpha: int = 32  # LoRA scaling factor
+    lora_r: int = 64  # LoRA rank (increased for fine-grained 500-class task)
+    lora_alpha: int = 64  # LoRA scaling factor
     lora_dropout: float = 0.1
     lora_target_modules: Tuple[str, ...] = (
-        "q_proj", "v_proj", "k_proj", "out_proj",
-    )  # Which attention projections to apply LoRA to
+        "q_proj", "v_proj", "k_proj", "out_proj", "c_fc", "c_proj",
+    )  # QKV + MLP layers in ViT for more capacity
 
     # --- Classification head ---
     num_classes: int = 400  # Override per dataset
-    classifier_dropout: float = 0.3
-    classifier_hidden_dim: int = 512  # Hidden dim before final FC
-    classifier_type: str = "fc"  # fc | cosine — cosine is more noise-robust
-    zero_shot_init: bool = False  # Init classifier with CLIP text encoder (class names)
+    classifier_dropout: float = 0.2
+    classifier_hidden_dim: int = 1024  # More capacity for fine-grained features
+    classifier_type: str = "cosine"  # cosine is more noise-robust
+    zero_shot_init: bool = True  # Init classifier with CLIP text encoder (class names)
 
     # --- Prompt Learning (CoOp-style) ---
-    use_prompt_learner: bool = False  # Learnable text prompts for CLIP text encoder
-    prompt_n_ctx: int = 8  # Number of learnable context tokens
-    prompt_init: str = "a photo of a"  # Initial context words (set to "" for random)
-    prompt_fusion_weight: float = 0.3  # Weight for text branch logits (0-1)
+    use_prompt_learner: bool = True  # Learnable text prompts for multimodal classification
+    prompt_n_ctx: int = 16  # More context tokens for richer text representation
+    prompt_init: str = "a photo of a"  # Initial context words
+    prompt_fusion_weight: float = 0.2  # Weight for text branch logits (0-1), start conservative
 
 
 @dataclass
@@ -57,10 +58,10 @@ class DataConfig:
 
     # --- Augmentation ---
     use_randaug: bool = True
-    randaug_n: int = 2
-    randaug_m: int = 10
+    randaug_n: int = 3  # More augmentation operations
+    randaug_m: int = 15  # Higher magnitude for stronger regularization
     use_mixup: bool = True
-    mixup_alpha: float = 0.4
+    mixup_alpha: float = 0.5  # Slightly stronger mixing
     use_cutmix: bool = True
     cutmix_alpha: float = 1.0
     label_smoothing: float = 0.1
@@ -77,38 +78,38 @@ class LossConfig:
     """Loss function configuration."""
 
     # --- ELR (Early-Learning Regularization) ---
-    elr_lambda: float = 3.0  # Regularization strength (main hyperparameter)
-    elr_beta: float = 0.7  # EMA momentum for target estimation
+    elr_lambda: float = 5.0  # Stronger regularization for noisy data
+    elr_beta: float = 0.9  # Slower EMA for more stable target estimation
 
     # --- GCE (Generalized Cross-Entropy) ---
     gce_q: float = 0.7  # q < 1.0 for noise robustness; q=1.0 is standard CE
 
     # --- Combined loss ---
-    loss_type: str = "elr"  # Options: "ce", "elr", "gce", "elr+gce"
-    elr_weight: float = 1.0  # Weight for ELR term when combined
-    gce_weight: float = 0.5  # Weight for GCE term when combined
+    loss_type: str = "elr+gce"  # Combine ELR and GCE for best noise robustness
+    elr_weight: float = 1.0  # Weight for ELR term
+    gce_weight: float = 0.3  # Weight for GCE term (lower to not dominate)
 
     # --- SupCon (Supervised Contrastive Learning) ---
-    use_supcon: bool = False  # Enable supervised contrastive loss
+    use_supcon: bool = True  # Enable supervised contrastive loss for better features
     supcon_weight: float = 0.1  # Weight for contrastive loss
     supcon_temperature: float = 0.07  # Contrastive temperature
     supcon_clean_only: bool = True  # Only apply SupCon to GMM-clean samples
 
     # --- GMM Sample Selection (DivideMix-style) ---
-    use_gmm_selection: bool = False  # Enable dynamic clean/noisy separation
+    use_gmm_selection: bool = True  # Enable dynamic clean/noisy separation
     gmm_warmup_epochs: int = 10  # Epochs before starting GMM selection
     gmm_momentum: float = 0.9  # EMA momentum for loss history per sample
     gmm_p_threshold: float = 0.5  # Posterior threshold for clean classification
 
     # --- Label Co-Refinement ---
-    use_label_refinement: bool = False  # Correct noisy labels with model predictions
-    refine_alpha: float = 0.5  # Initial trust in model predictions
-    refine_max_alpha: float = 0.9  # Maximum trust in model predictions
+    use_label_refinement: bool = True  # Correct noisy labels with model predictions
+    refine_alpha: float = 0.3  # Initial trust in model predictions (lower = safer)
+    refine_max_alpha: float = 0.7  # Maximum trust in model predictions
 
     # --- Co-Teaching (dual-network mutual sample selection) ---
-    use_co_teaching: bool = False  # Two networks select clean samples for each other
-    co_teach_forget_rate: float = 0.3  # Final fraction of samples to forget
-    co_teach_num_gradual: int = 10  # Epochs over which to decay remember rate
+    use_co_teaching: bool = False  # Disabled: empirically hurts with ELR+cosine setup
+    co_teach_forget_rate: float = 0.3
+    co_teach_num_gradual: int = 10
 
 
 @dataclass
@@ -117,22 +118,22 @@ class TrainConfig:
 
     # --- Optimization ---
     optimizer: str = "adamw"  # adamw | sgd
-    lr: float = 1e-4  # Base learning rate
-    lr_backbone_multiplier: float = 0.1  # Backbone LR = lr * this
-    lr_head_multiplier: float = 1.0  # Classifier head LR = lr * this
+    lr: float = 5e-4  # Higher LR for LoRA + classifier head
+    lr_backbone_multiplier: float = 0.05  # Very low LR for frozen backbone
+    lr_head_multiplier: float = 1.5  # Higher LR for classifier head
     weight_decay: float = 0.05
     betas: Tuple[float, float] = (0.9, 0.999)
 
     # --- Scheduler ---
-    lr_scheduler: str = "cosine"  # cosine | step | plateau | onecycle
+    lr_scheduler: str = "onecycle"  # OneCycleLR for faster convergence
     warmup_epochs: int = 5
     warmup_lr: float = 1e-6
     min_lr: float = 1e-7
 
     # --- Training loop ---
-    epochs: int = 100
+    epochs: int = 40  # OneCycle converges fast
     batch_size: int = 64
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: int = 2  # Effective batch size = 128
     max_grad_norm: float = 1.0
 
     # --- Mixed precision ---
@@ -141,13 +142,13 @@ class TrainConfig:
 
     # --- Knowledge distillation (teacher-free / self-distillation) ---
     use_self_distillation: bool = True
-    distill_temperature: float = 4.0
-    distill_weight: float = 0.5
+    distill_temperature: float = 3.0  # Slightly lower temperature
+    distill_weight: float = 0.3  # Lower weight: let supervised loss dominate first
     ema_teacher_alpha: float = 0.999  # EMA momentum for teacher model
-    ema_teacher_warmup: int = 100  # Steps before starting EMA teacher updates
+    ema_teacher_warmup: int = 200  # Longer warmup before distillation kicks in
 
     # --- Early stopping ---
-    early_stopping_patience: int = 20
+    early_stopping_patience: int = 12  # ~30% of training, reasonable for noisy data
     early_stopping_metric: str = "val_acc"
 
 
@@ -184,7 +185,7 @@ class DefaultConfig:
     log_interval: int = 50  # Log every N steps
     eval_interval: int = 1  # Evaluate every N epochs
     save_interval: int = 10  # Save checkpoint every N epochs
-    use_wandb: bool = True
+    use_wandb: bool = False
     wandb_project: str = "clip-lora-elr-noise"
 
 
@@ -203,19 +204,28 @@ def get_config(dataset: str = "webfg400", **overrides) -> DefaultConfig:
 
     if dataset == "webfg400":
         cfg.dataset = "webfg400"
-        cfg.model.num_classes = 400
-        # WebFG-400: 400 classes, ~43k train images
-        cfg.train.epochs = 100
+        cfg.model.num_classes = 500  # Actual data has 500 classes
+        # 500 classes, ~103k train images, ~200 images/class
+        cfg.train.epochs = 40
         cfg.train.batch_size = 64
-        cfg.loss.elr_lambda = 3.0
+        cfg.train.gradient_accumulation_steps = 2  # Effective batch = 128
+        cfg.loss.elr_lambda = 5.0
+        cfg.loss.elr_beta = 0.9
+        cfg.train.lr = 5e-4
+        cfg.train.lr_scheduler = "onecycle"
     elif dataset == "webinat5000":
         cfg.dataset = "webinat5000"
         cfg.model.num_classes = 5000
         # WebiNat-5000: 5000 classes, ~580k train images
         cfg.train.epochs = 80
         cfg.train.batch_size = 32  # More classes -> smaller batch
-        cfg.loss.elr_lambda = 5.0  # Stronger regularization for more noise
-        cfg.train.gradient_accumulation_steps = 2
+        cfg.loss.elr_lambda = 7.0  # Stronger regularization for more noise
+        cfg.loss.elr_beta = 0.95  # Even slower EMA for 5000 classes
+        cfg.train.gradient_accumulation_steps = 4  # Effective batch = 128
+        cfg.train.lr = 3e-4
+        cfg.train.lr_scheduler = "onecycle"
+        cfg.model.classifier_hidden_dim = 1024
+        cfg.model.lora_r = 64
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
 

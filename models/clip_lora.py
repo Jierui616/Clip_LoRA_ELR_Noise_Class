@@ -80,10 +80,29 @@ class CLIPLoRAModel(nn.Module):
         self.prompt_fusion_weight = prompt_fusion_weight
         self.zero_shot_init = zero_shot_init
 
-        # Load CLIP model
-        self.clip_model, _, self.preprocess = open_clip.create_model_and_transforms(
-            clip_model, pretrained=pretrained
-        )
+        # Load CLIP model — try local weights first if available
+        import os as _os
+        local_path = getattr(self, '_local_pretrained_path', None)
+        if local_path is None and pretrained == "openai":
+            # Try common local paths
+            candidates = [
+                "./data/ViT-B-32_openai.bin",
+                "data/ViT-B-32_openai.bin",
+            ]
+            for cand in candidates:
+                if _os.path.exists(cand):
+                    local_path = cand
+                    break
+
+        if local_path and _os.path.exists(local_path):
+            print(f"[CLIPLoRA] Loading pretrained weights from local: {local_path}")
+            self.clip_model, _, self.preprocess = open_clip.create_model_and_transforms(
+                clip_model, pretrained=local_path
+            )
+        else:
+            self.clip_model, _, self.preprocess = open_clip.create_model_and_transforms(
+                clip_model, pretrained=pretrained
+            )
         self.visual = self.clip_model.visual
 
         # Feature dimension from CLIP ViT
@@ -103,6 +122,14 @@ class CLIPLoRAModel(nn.Module):
             for name, param in self.visual.named_parameters():
                 if "lora_A" not in name and "lora_B" not in name:
                     param.requires_grad_(False)
+
+            # Also freeze the CLIP text encoder (used only for zero-shot init)
+            for param in self.clip_model.parameters():
+                param.requires_grad_(False)
+            # Unfreeze visual LoRA params (they were frozen by the loop above)
+            for name, param in self.visual.named_parameters():
+                if "lora_A" in name or "lora_B" in name:
+                    param.requires_grad_(True)
 
         # --- Zero-shot init: encode class names with CLIP text encoder ---
         text_prototypes = None

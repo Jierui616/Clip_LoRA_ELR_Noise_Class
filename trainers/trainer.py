@@ -208,6 +208,11 @@ class Trainer:
         self.patience_counter = 0
         self.global_step = 0
 
+        # SWA (Stochastic Weight Averaging) — averages model weights over last ~25% epochs
+        self.swa_model = None
+        self.swa_start_epoch = int(config.train.epochs * 0.75)  # Start SWA at 75% mark
+        self.swa_count = 0
+
         # Metrics history
         self.train_losses = []
         self.val_accs = []
@@ -369,6 +374,22 @@ class Trainer:
                 val_acc = val_results["top1_acc"]
                 self.val_accs.append(val_acc)
 
+                # SWA update (average model weights over late training)
+                if epoch >= self.swa_start_epoch:
+                    if self.swa_model is None:
+                        import copy
+                        self.swa_model = copy.deepcopy(self.model)
+                        print(f"  SWA started at epoch {epoch + 1}")
+                    else:
+                        # Running average: θ_swa = (n*θ_swa + θ_new) / (n+1)
+                        self.swa_count += 1
+                        for swa_param, model_param in zip(
+                            self.swa_model.parameters(), self.model.parameters()
+                        ):
+                            swa_param.data = (
+                                self.swa_count * swa_param.data + model_param.data
+                            ) / (self.swa_count + 1)
+
                 # Logging
                 log_str = (
                     f"Epoch {epoch + 1:3d}/{cfg.epochs} | "
@@ -441,6 +462,37 @@ class Trainer:
         print(f"Training complete!")
         print(f"Best Val Acc: {self.best_acc * 100:.2f}% "
               f"(epoch {self.best_epoch + 1})")
+
+        # Evaluate SWA model
+        if self.swa_model is not None:
+            original_model = self.model
+            self.model = self.swa_model.to(self.device)
+            self.model.eval()
+            swa_results = self.evaluator.evaluate(
+                self.val_loader,
+                num_classes=self.config.model.num_classes,
+                desc="SWA Val",
+            )
+            swa_acc = swa_results["top1_acc"]
+            print(f"SWA Val Acc: {swa_acc * 100:.2f}%")
+
+            # Save SWA model if it's better
+            swa_path = self.output_dir / "swa_model.pth"
+            torch.save({
+                "model_state_dict": self.swa_model.state_dict(),
+                "val_acc": swa_acc,
+                "swa_count": self.swa_count,
+                "config": self.config,
+            }, swa_path)
+            print(f"SWA model saved to {swa_path}")
+
+            # Restore original (or keep SWA if better)
+            if swa_acc > self.best_acc:
+                print(f"  SWA is better! Using SWA model.")
+                self.model = self.swa_model
+            else:
+                self.model = original_model
+
         print(f"{'='*60}")
 
         if self.use_wandb:
@@ -561,7 +613,12 @@ class Trainer:
                         distill_loss = self._distillation_loss(
                             logits, teacher_logits, cfg.distill_temperature
                         )
-                        loss = loss + cfg.distill_weight * distill_loss
+                        # Progressive distillation: ramp up weight from 0 to distill_weight
+                        # over first 60% of training epochs
+                        total_epochs = cfg.epochs
+                        progress = min(1.0, epoch / max(1, int(total_epochs * 0.6)))
+                        progressive_weight = cfg.distill_weight * progress
+                        loss = loss + progressive_weight * distill_loss
 
                 # Scale for gradient accumulation
                 loss = loss / cfg.gradient_accumulation_steps
@@ -780,10 +837,10 @@ class Trainer:
             if self.criterion.elr is not None:
                 self.criterion.elr.target.copy_(checkpoint["elr_targets"])
 
-        # Restore GMM state
+        # Restore GMM state (keep on CPU for sklearn compatibility)
         if "loss_history" in checkpoint and self.sample_selector:
-            self.sample_selector.loss_history = checkpoint["loss_history"]
-            self.sample_selector.loss_count = checkpoint["loss_count"]
+            self.sample_selector.loss_history = checkpoint["loss_history"].cpu()
+            self.sample_selector.loss_count = checkpoint["loss_count"].cpu()
 
         print(f"  Resumed from epoch {self.current_epoch}")
 

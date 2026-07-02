@@ -110,10 +110,12 @@ class ELRLoss(nn.Module):
 
         # --- Cross-entropy loss ---
         if is_soft:
-            # Soft labels: compute KL divergence
+            # Soft labels (MixUp/CutMix): compute KL divergence
+            # CE(p, q) = -sum(p * log(q)) where p is soft target, q is prediction
             ce_loss = -(labels * torch.log(y_pred)).sum(dim=1).mean()
         else:
-            ce_loss = F.cross_entropy(outputs, labels)
+            # Standard CE with label smoothing for additional regularization
+            ce_loss = F.cross_entropy(outputs, labels, label_smoothing=0.05)
 
         # --- ELR regularization term ---
         # log(1 - <target, y_pred>), averaged over batch

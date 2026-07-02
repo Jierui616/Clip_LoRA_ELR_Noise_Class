@@ -206,8 +206,15 @@ def get_dataloaders(
         generator=torch.Generator().manual_seed(42),
     )
 
-    # Validation subset uses test transform (no augmentation)
-    val_subset.dataset = train_dataset  # Keep reference
+    # CRITICAL: Create a separate val dataset with test transforms (no augmentation)
+    # The val subset shares indices with train_dataset, but needs clean transforms
+    val_dataset = IndexedImageDataset(
+        root=train_root,
+        transform=test_transform,
+        is_train=True,
+    )
+    # Override val_subset to use val_dataset as underlying data
+    val_subset.dataset = val_dataset
 
     train_loader = torch.utils.data.DataLoader(
         train_subset,

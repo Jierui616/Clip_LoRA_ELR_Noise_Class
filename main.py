@@ -150,7 +150,8 @@ def main():
         val_split=getattr(cfg.data, 'val_split', 0.1),  # 10% for validation
     )
 
-    # Replace default collate with MixUp/CutMix collator for ELR training
+    # Replace default collate with MixUp/CutMix collator for stronger augmentation
+    # keep_hard_labels=True ensures ELR compatibility (image mixing only, no label mixing)
     mixup_collator = MixUpCutMixCollator(
         num_classes=cfg.model.num_classes,
         mixup_alpha=cfg.data.mixup_alpha,
@@ -158,12 +159,11 @@ def main():
         label_smoothing=cfg.data.label_smoothing,
         use_mixup=cfg.data.use_mixup,
         use_cutmix=cfg.data.use_cutmix,
+        keep_hard_labels=True,
+        mix_prob=0.5,
     )
-
-    # Note: MixUp/CutMix generates soft labels, which aren't compatible
-    # with the standard ELR loss (requires hard labels for CE component).
-    # We keep the standard collate for ELR training and use mixup only
-    # for data augmentation in transforms.
+    train_loader.collate_fn = mixup_collator
+    print("  MixUp/CutMix collator enabled (hard-label mode, prob=0.5)")
     num_train = len(train_dataset)
     print(f"  Train samples: {num_train}")
     print(f"  Classes: {cfg.model.num_classes}")

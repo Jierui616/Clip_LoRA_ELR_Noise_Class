@@ -42,16 +42,36 @@ def main():
     if not Path(pretrained_path).exists():
         pretrained_path = "openai"
 
-    # Build model
+    # Build model (use config from checkpoint if available)
     print("Loading model...")
-    model = CLIPLoRAModel(
-        num_classes=num_classes,
-        pretrained=pretrained_path,
-        lora_r=32, lora_alpha=64,
-        classifier_type="cosine",
-        classifier_hidden_dim=512,
-        zero_shot_init=False,
-    )
+    if config is not None:
+        cfg_model = config.model
+        model = CLIPLoRAModel(
+            num_classes=num_classes,
+            pretrained=pretrained_path,
+            lora_r=cfg_model.lora_r,
+            lora_alpha=cfg_model.lora_alpha,
+            lora_dropout=cfg_model.lora_dropout,
+            classifier_type=cfg_model.classifier_type,
+            classifier_hidden_dim=cfg_model.classifier_hidden_dim,
+            classifier_dropout=cfg_model.classifier_dropout,
+            zero_shot_init=cfg_model.zero_shot_init,
+            use_prompt_learner=cfg_model.use_prompt_learner,
+            prompt_n_ctx=cfg_model.prompt_n_ctx,
+            prompt_fusion_weight=cfg_model.prompt_fusion_weight,
+        )
+    else:
+        model = CLIPLoRAModel(
+            num_classes=num_classes,
+            pretrained=pretrained_path,
+            lora_r=64, lora_alpha=64,
+            classifier_type="cosine",
+            classifier_hidden_dim=1024,
+            zero_shot_init=True,
+            use_prompt_learner=True,
+            prompt_n_ctx=16,
+            prompt_fusion_weight=0.2,
+        )
     model.load_state_dict(checkpoint["model_state_dict"])
     model = model.to(device)
     model.eval()
@@ -90,7 +110,6 @@ def main():
     # Write result.csv
     print(f"Writing {len(test_dataset)} predictions to {args.output}...")
     with open(args.output, "w") as f:
-        f.write("filename,label\n")
         for i, (path, _) in enumerate(test_dataset.samples):
             filename = Path(path).name
             f.write(f"{filename},{all_preds[i].item()}\n")
@@ -98,7 +117,7 @@ def main():
     print(f"Done! Result saved to {args.output}")
     print(f"First 5 predictions:")
     with open(args.output) as f:
-        for _ in range(6):
+        for _ in range(5):
             print(f"  {f.readline().strip()}")
 
 

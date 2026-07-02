@@ -14,15 +14,37 @@
 
 ## 开发环境
 
-```bash
-# 激活环境后直接运行
-pip install -r requirements.txt
+**所有开发/训练/推理都在 WSL (Ubuntu-22.04) 的 `clora` conda 环境中进行。**
 
-# 核心依赖
-# - torch >= 2.0.0
-# - open-clip-torch >= 2.24.0
-# - peft >= 0.6.0 (可选，我们使用自定义 LoRA)
+```bash
+# 在 WSL 终端中激活环境
+source ~/anaconda3/etc/profile.d/conda.sh
+conda activate clora
+
+# 验证环境
+python -c "import torch; print(f'torch: {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}')"
+# → torch: 2.5.1+cu124, CUDA: True
+
+# 项目在 Windows 的路径，WSL 中对应的路径：
+# Windows: D:\zhuomian\Clip_LoRA_ELR_Noise_Class
+# WSL:     /mnt/d/zhuomian/Clip_LoRA_ELR_Noise_Class
+cd /mnt/d/zhuomian/Clip_LoRA_ELR_Noise_Class
+
+# 所有 Python 命令使用 WSL + clora 环境：
+# wsl bash -c "source ~/anaconda3/etc/profile.d/conda.sh && conda activate clora && cd /mnt/d/zhuomian/Clip_LoRA_ELR_Noise_Class && python main.py ..."
 ```
+
+### 核心依赖
+
+- torch 2.5.1+cu124 (CUDA 12.4)
+- open-clip-torch 3.3.0
+- peft 0.19.1 (可选，我们使用自定义 LoRA)
+- sklearn (GMM 噪声过滤需要)
+
+### 预训练权重
+
+CLIP ViT-B-32 权重已下载到本地：`data/ViT-B-32_openai.bin` (577 MB)。
+HuggingFace 在国内可能被墙，代码会自动检测并使用本地权重文件。
 
 ## 项目架构
 

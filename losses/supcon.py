@@ -80,13 +80,13 @@ class SupConLoss(nn.Module):
         # Compute similarity matrix
         anchor_dot_contrast = torch.matmul(features, features.T) / self.temperature
 
-        # Mask out self-contrast
-        logits_mask = torch.ones_like(anchor_dot_contrast).fill_diagonal_(0)
+        # Mask out self-contrast (non-inplace)
+        logits_mask = 1.0 - torch.eye(batch_size, device=device)
 
         # Build positive mask (same class)
         labels = labels.contiguous().view(-1, 1)
         positive_mask = labels.eq(labels.T).float()
-        positive_mask.fill_diagonal_(0)
+        positive_mask = positive_mask * (1.0 - torch.eye(batch_size, device=device))  # Non-inplace
 
         # Apply clean sample mask if provided
         if mask is not None:
@@ -204,14 +204,15 @@ class NoiseRobustSupConLoss(nn.Module):
         # === 1. Student-Student Contrast (standard SupCon) ===
         s_sim = s_feat @ s_feat.T / self.temperature
         pos_mask = labels.contiguous().view(-1, 1).eq(labels.contiguous().view(1, -1)).float()
-        pos_mask.fill_diagonal_(0)
+        # Non-inplace: avoid modifying tensors needed for autograd
+        diag_mask = 1.0 - torch.eye(batch_size, device=device)
+        pos_mask = pos_mask * diag_mask
 
         if clean_mask is not None:
             cm = clean_mask.float()
             pos_mask = pos_mask * (cm.view(-1, 1) * cm.view(1, -1))
 
-        exp_sim = torch.exp(s_sim)
-        exp_sim.fill_diagonal_(0)
+        exp_sim = torch.exp(s_sim) * diag_mask  # Non-inplace mask diagonal
 
         pos_sum = (exp_sim * pos_mask).sum(dim=1)
         all_sum = exp_sim.sum(dim=1)

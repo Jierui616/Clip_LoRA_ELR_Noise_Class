@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Generate test set predictions and result.csv for competition submission.
+Generate test set predictions and pred_results.csv for competition submission.
 
 Usage:
     python scripts/predict_test.py \
         --resume outputs/fast30/best_model.pth \
         --data_root ./data \
-        --output result.csv
+        --output pred_results.csv
 """
 
 import argparse
@@ -25,7 +25,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", required=True, help="Path to best model checkpoint")
     parser.add_argument("--data_root", default="./data", help="Data root directory")
-    parser.add_argument("--output", default="result.csv", help="Output CSV file")
+    parser.add_argument("--output", default="pred_results.csv", help="Output CSV file")
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--use_tta", action="store_true", help="Use TTA for better accuracy")
     args = parser.parse_args()
@@ -107,7 +107,7 @@ def main():
 
     all_preds = torch.cat(all_preds)
 
-    # Write result.csv
+    # Write pred_results.csv
     print(f"Writing {len(test_dataset)} predictions to {args.output}...")
     with open(args.output, "w") as f:
         for i, (path, _) in enumerate(test_dataset.samples):

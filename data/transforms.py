@@ -10,6 +10,7 @@ from typing import Tuple
 import torch
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as TF
 
 # CLIP ViT-B/32 normalization
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
@@ -28,6 +29,20 @@ def get_train_transforms(
     RandAugment helps prevent overfitting to noisy labels by applying
     aggressive data augmentation.
     """
+    if not use_randaug:
+        # 社区对齐结论（同赛题 Luqhhh 仓库实测）：细粒度 + 噪声标签任务中，
+        # 强增强（RandomResizedCrop/ColorJitter/RandomErasing）均无正面甚至负收益。
+        # 仅保留 CLIP 标准预处理（Resize 256 -> CenterCrop 224）。
+        return transforms.Compose([
+            transforms.Resize(
+                int(image_size * 256 / 224),
+                interpolation=InterpolationMode.BICUBIC,
+            ),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD),
+        ])
+
     aug_list = [
         transforms.RandomResizedCrop(
             image_size,
@@ -58,6 +73,45 @@ def get_train_transforms(
     return transforms.Compose(aug_list)
 
 
+class MultiScaleTTA:
+    """
+    Multi-scale + flip test-time augmentation.
+
+    At each resize scale, produces 10 distinct views via TenCrop
+    (5 positions x original/flipped) and stacks them into (N, C, H, W).
+
+    Fixes the previous TTA defects:
+    - 224x224 TenCrop severe overlap: crops are now taken from images resized
+      to scales LARGER than the crop size, so crops are actually distinct.
+    - Lack of horizontal flip: TenCrop includes the horizontally-flipped views.
+    - Lack of multi-scale: multiple resize scales are used.
+    """
+
+    def __init__(
+        self,
+        image_size: int = 224,
+        crop_size: int = 224,
+        scales: Tuple[int, ...] = None,
+    ):
+        self.crop_size = crop_size
+        self.scales = (
+            tuple(scales)
+            if scales is not None
+            else (image_size + 32, image_size + 64)
+        )
+        self.normalize = transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD)
+
+    def __call__(self, img) -> torch.Tensor:
+        views = []
+        for s in self.scales:
+            resized = TF.resize(
+                img, s, interpolation=InterpolationMode.BICUBIC
+            )
+            for crop in TF.ten_crop(resized, self.crop_size):
+                views.append(self.normalize(TF.to_tensor(crop)))
+        return torch.stack(views)  # (num_scales * 10, C, H, W)
+
+
 def get_test_transforms(
     image_size: int = 224,
     crop_size: int = 224,
@@ -70,20 +124,15 @@ def get_test_transforms(
     Args:
         image_size: Resize short edge to this size
         crop_size: Center crop size
-        is_tta: If True, use TenCrop for test-time augmentation
-        tta_crops: Number of crops for TTA (5 or 10)
+        is_tta: If True, use multi-scale + flip TTA (overrides the previous
+            overlapping 224x224 TenCrop)
+        tta_crops: Unused; kept for backward compatibility.
     """
     if is_tta:
         return transforms.Compose([
-            transforms.Resize(
-                image_size, interpolation=InterpolationMode.BICUBIC
-            ),
-            transforms.TenCrop(crop_size),
-            transforms.Lambda(
-                lambda crops: torch.stack(
-                    [transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD)(transforms.ToTensor()(crop))
-                     for crop in crops]
-                )
+            MultiScaleTTA(
+                image_size=image_size,
+                crop_size=crop_size,
             ),
         ])
 

@@ -147,6 +147,18 @@ bash scripts/eval.sh ./outputs/webfg400_r16_lambda3/best_model.pth webfg400
 python main.py --eval_only --resume ./outputs/best_model.pth --dataset webfg400
 ```
 
+### 预测测试集
+
+```bash
+# 生成提交文件 pred_results.csv（含 fp16 分块 TTA，20 视图）
+PYTHONPATH=. python scripts/predict_test.py \
+    --resume outputs/fixres384/best_model.pth \
+    --data_root ./data \
+    --output pred_results.csv \
+    --batch_size 32 \
+    --use_tta
+```
+
 ### 噪声检测
 
 ```bash
@@ -158,23 +170,32 @@ python main.py --detect_noise --dataset webfg400 --data_root ./data/WebFG-400
 
 | 超参数 | 默认值 | 说明 |
 |--------|--------|------|
-| `model.lora_r` | 16 | LoRA 秩，越大容量越大 |
-| `model.lora_alpha` | 32 | LoRA 缩放因子 |
-| `model.classifier_type` | fc | fc 或 cosine（余弦分类器更鲁棒） |
-| `model.use_prompt_learner` | False | CoOp 可学习提示，利用 CLIP 文本编码器 |
-| `model.prompt_fusion_weight` | 0.3 | 文本分支融合权重 |
-| `loss.elr_lambda` | 3.0 (FG) / 5.0 (iNat) | ELR 正则化强度 |
-| `loss.elr_beta` | 0.7 | EMA 动量 |
-| `loss.gce_q` | 0.7 | GCE q 参数 |
-| `loss.use_gmm_selection` | False | GMM 动态干净/噪声分离 |
+| `model.image_size` | 224 | 输入分辨率（FixRes 可升至 384） |
+| `model.lora_r` | 64 | LoRA 秩，越大容量越大 |
+| `model.lora_alpha` | 64 | LoRA 缩放因子 |
+| `model.classifier_type` | cosine | cosine 余弦分类器（噪声鲁棒） |
+| `model.classifier_hidden_dim` | 1024 | 分类头隐藏维度 |
+| `model.use_prompt_learner` | True | CoOp 可学习提示，利用 CLIP 文本编码器 |
+| `model.prompt_fusion_weight` | 0.2 | 文本分支融合权重（最优初始化为 -1.0） |
+| `model.zero_shot_init` | True | 用 CLIP 文本编码器零样本初始化分类头 |
+| `loss.elr_lambda` | 5.0 (FG) / 7.0 (iNat) | ELR 正则化强度 |
+| `loss.elr_beta` | 0.9 | EMA 动量 |
+| `loss.gce_q` | 0.7 | GCE q 参数（q<1 噪声鲁棒） |
+| `loss.gce_weight` | 0.3 | GCE 损失权重 |
+| `loss.use_gmm_selection` | True | GMM 动态干净/噪声分离 |
 | `loss.gmm_warmup_epochs` | 10 | GMM 预热轮数 |
-| `loss.use_label_refinement` | False | 标签修正 |
-| `loss.use_supcon` | False | 监督对比学习 |
+| `loss.use_label_refinement` | True | 标签修正 |
+| `loss.use_supcon` | True | 监督对比学习（仅干净样本） |
 | `loss.supcon_weight` | 0.1 | 对比损失权重 |
-| `train.lr` | 1e-4 | 基础学习率 |
-| `train.epochs` | 100 / 80 | 训练轮数 |
+| `loss.use_co_teaching` | False | 协同教学（实验性，默认关闭） |
+| `train.lr` | 5e-4 | 基础学习率 |
+| `train.lr_scheduler` | onecycle | 学习率调度器 |
+| `train.epochs` | 40 / 80 | 训练轮数 |
+| `train.batch_size` | 64 | 批大小（梯度累积 ×2 = 128） |
+| `train.gradient_accumulation_steps` | 2 | 梯度累积步数 |
+| `train.use_amp` | True | 混合精度训练 |
+| `train.use_self_distillation` | True | 自蒸馏（EMA 教师） |
 | `train.ema_teacher_alpha` | 0.999 | EMA 教师动量 |
-| `train.use_self_distillation` | True | 自蒸馏 |
 
 完整配置见 `config/default.py`。
 
@@ -185,30 +206,35 @@ Clip_LoRA_ELR_Noise_Class/
 ├── README.md                   # 项目说明
 ├── CLAUDE.md                   # AI 辅助开发文档
 ├── requirements.txt            # Python 依赖
-├── main.py                     # 主入口
+├── main.py                     # 主入口（训练/评估/噪声检测）
 ├── config/
 │   ├── __init__.py
 │   └── default.py              # 默认配置（所有超参数）
 ├── data/
 │   ├── __init__.py
 │   ├── dataset.py              # 索引化数据集（支持 ELR 的样本级目标）
-│   ├── transforms.py           # 数据增强（RandAugment, MixUp, CutMix）
+│   ├── transforms.py           # 数据增强（RandAugment, MultiScaleTTA, MixUp, CutMix）
 │   └── sampler.py              # 平衡采样器（缓解长尾分布）
 ├── models/
 │   ├── __init__.py
-│   ├── clip_lora.py            # CLIP + LoRA 完整模型
+│   ├── clip_lora.py            # CLIP + LoRA 完整模型（含 FixRes 位置嵌入插值）
 │   ├── lora.py                 # LoRA 低秩适配器实现
-│   └── classifier.py           # 分类头
+│   ├── classifier.py           # 分类头（cosine / FC）
+│   └── prompt_learner.py       # CoOp 可学习文本提示
 ├── losses/
 │   ├── __init__.py
 │   ├── elr.py                  # ELR 损失（防止噪声标签记忆）
 │   ├── gce.py                  # 广义交叉熵损失（噪声鲁棒）
-│   └── combined.py             # 组合损失策略
+│   ├── combined.py             # 组合损失策略
+│   ├── supcon.py               # 监督对比学习（噪声鲁棒）
+│   ├── co_teaching.py          # 双网络互选干净样本（实验性）
+│   ├── noise_filter.py         # GMM 干净/噪声样本选择（DivideMix）
+│   └── ema_teacher.py          # EMA 教师模型（自蒸馏）
 ├── trainers/
 │   ├── __init__.py
-│   ├── trainer.py              # 训练循环（AMP/梯度累积/蒸馏）
+│   ├── trainer.py              # 训练循环（AMP/梯度累积/蒸馏/GMM）
 │   ├── evaluator.py            # 评估器（TTA/多尺度投票）
-│   └── lr_scheduler.py         # 学习率调度（Cosine+Warmup）
+│   └── lr_scheduler.py         # 学习率调度（OneCycle/Cosine）
 ├── utils/
 │   ├── __init__.py
 │   ├── logger.py               # 日志工具
@@ -219,7 +245,15 @@ Clip_LoRA_ELR_Noise_Class/
 └── scripts/
     ├── train_webfg400.sh       # WebFG-400 训练脚本
     ├── train_webinat5000.sh    # WebiNat-5000 训练脚本
-    └── eval.sh                 # 评估脚本
+    ├── train_fixres384.sh      # FixRes 384 分辨率实验
+    ├── train_sv1_fusion.sh     # 融合权重实验（sv1）
+    ├── train_sv2_fusion.sh     # 融合权重实验（sv2）
+    ├── train_reproduce.sh      # 基线复现脚本
+    ├── eval.sh                 # 评估脚本
+    ├── eval_tta_val.py         # TTA 验证集评估
+    ├── predict_test.py         # 测试集预测（含 fp16 分块 TTA）
+    ├── quick_test.sh           # 一键测试（合成数据）
+    └── create_test_data.py     # 生成合成测试数据
 ```
 
 ## 🔬 关键技术详解
@@ -257,6 +291,21 @@ $$
 ### 4. 自蒸馏 (Self-Distillation)
 
 使用模型自身的指数移动平均版本作为教师，产生软标签指导学生训练，提供额外的正则化信号。
+
+## 🏆 实验结果
+
+| 实验 | 配置 | Best Val Acc（单 crop） | 相对基线 |
+|------|------|------------------------|----------|
+| 基线 sv1 | 224px + fusion=-1.0 | 75.81% | — |
+| **FixRes 384** | 384px + fusion=-1.0 | **78.64%** | **+2.83%** |
+
+**关键优化发现（单变量实验）：**
+
+- **分辨率提升（FixRes）**: 224 → 384，对 CLIP 位置嵌入做双三次插值适配，单 crop 提升 +2.83%（75.81% → 78.64%），GMM clean_ratio 随训练升至 ~78%
+- **测试时增强（MultiScaleTTA）**: 多尺度（256/288 或 416/448）+ 水平翻转 + TenCrop，20 视图投票，验证集 +8.69%（224 模型 75.81% → 84.50%）
+- **融合权重**: `prompt_fusion_weight=-1.0`（sigmoid≈0.27）为最优点，优于更负或正的初始化
+
+预测结果由 `scripts/predict_test.py` 生成，`--use_tta` 启用 fp16 分块前向 TTA（384 分辨率下稳定运行）。
 
 ## 📈 评价指标
 

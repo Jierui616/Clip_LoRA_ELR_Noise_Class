@@ -38,6 +38,11 @@ def main():
     config = checkpoint.get("config", None)
 
     num_classes = 500
+    # FixRes 分辨率提升实验（224->384）的模型需按 checkpoint 中的 image_size 重建，
+    # 否则位置嵌入尺寸不匹配会导致 load_state_dict 失败。
+    image_size = int(getattr(config.model, "image_size", 224)) if config is not None else 224
+    print(f"image_size: {image_size}")
+
     pretrained_path = f"{args.data_root}/ViT-B-32_openai.bin"
     if not Path(pretrained_path).exists():
         pretrained_path = "openai"
@@ -48,6 +53,7 @@ def main():
         cfg_model = config.model
         model = CLIPLoRAModel(
             num_classes=num_classes,
+            image_size=image_size,
             pretrained=pretrained_path,
             lora_r=cfg_model.lora_r,
             lora_alpha=cfg_model.lora_alpha,
@@ -63,6 +69,7 @@ def main():
     else:
         model = CLIPLoRAModel(
             num_classes=num_classes,
+            image_size=image_size,
             pretrained=pretrained_path,
             lora_r=64, lora_alpha=64,
             classifier_type="cosine",
@@ -78,29 +85,49 @@ def main():
     print(f"Model loaded from {args.resume}")
 
     # Test dataset
-    test_transform = get_test_transforms(image_size=224, is_tta=args.use_tta)
+    test_transform = get_test_transforms(
+        image_size=image_size,
+        crop_size=image_size,
+        is_tta=args.use_tta,
+    )
     test_dataset = IndexedImageDataset(
         root=f"{args.data_root}/test",
         transform=test_transform,
         is_train=False,
     )
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
-                             shuffle=False, num_workers=4, pin_memory=True)
+                             shuffle=False, num_workers=2, pin_memory=True)
 
     # Generate predictions
     print(f"Predicting {len(test_dataset)} test images...")
     all_filenames = []
     all_preds = []
 
+    use_amp = device.type == "cuda"
+    tta_chunk = 512  # 每次前向的最大图像数，避免 20-view 展开导致的显存峰值
+
     with torch.no_grad():
         for images, _, _ in tqdm(test_loader, desc="Predicting"):
             if args.use_tta:
                 bs, nc, c, h, w = images.shape
-                images = images.view(-1, c, h, w)
-                logits = model(images.to(device))
-                logits = logits.view(bs, nc, -1).mean(dim=1)
+                images = images.view(-1, c, h, w).to(device)
+                # 分块前向（fp16），求和后对 views 取均值
+                logits_chunks = []
+                for i in range(0, images.size(0), tta_chunk):
+                    chunk = images[i:i + tta_chunk]
+                    if use_amp:
+                        with torch.autocast(device_type="cuda", dtype=torch.float16):
+                            logits_chunks.append(model(chunk))
+                    else:
+                        logits_chunks.append(model(chunk))
+                logits = torch.cat(logits_chunks, dim=0).view(bs, nc, -1).mean(dim=1)
             else:
-                logits = model(images.to(device))
+                images = images.to(device)
+                if use_amp:
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        logits = model(images)
+                else:
+                    logits = model(images)
 
             preds = logits.argmax(dim=1)
             all_preds.append(preds.cpu())

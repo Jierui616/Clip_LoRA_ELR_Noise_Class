@@ -131,6 +131,7 @@ def main():
     )
     test_transform = get_test_transforms(
         image_size=cfg.data.image_size,
+        crop_size=cfg.data.image_size,
         is_tta=cfg.eval.use_tta if args.eval_only else False,
         tta_crops=cfg.eval.tta_crops,
     )
@@ -176,6 +177,7 @@ def main():
 
     model = CLIPLoRAModel(
         num_classes=cfg.model.num_classes,
+        image_size=cfg.model.image_size,
         clip_model=cfg.model.clip_model,
         pretrained=cfg.model.pretrained,
         lora_r=cfg.model.lora_r,

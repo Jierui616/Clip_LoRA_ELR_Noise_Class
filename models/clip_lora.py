@@ -53,6 +53,7 @@ class CLIPLoRAModel(nn.Module):
     def __init__(
         self,
         num_classes: int = 400,
+        image_size: int = 224,
         clip_model: str = "ViT-B-32",
         pretrained: str = "openai",
         lora_r: int = 16,
@@ -104,6 +105,9 @@ class CLIPLoRAModel(nn.Module):
                 clip_model, pretrained=pretrained
             )
         self.visual = self.clip_model.visual
+
+        # FixRes: interpolate positional_embedding when target resolution != 224
+        self._interpolate_pos_encoding(image_size)
 
         # Feature dimension from CLIP ViT
         self.feature_dim = self.visual.output_dim  # 512 for ViT-B/32
@@ -175,6 +179,62 @@ class CLIPLoRAModel(nn.Module):
             print(f"[CLIPLoRA] Prompt learner: n_ctx={prompt_n_ctx}")
         if classifier_type == "cosine":
             print("[CLIPLoRA] Cosine classifier enabled")
+
+    def _interpolate_pos_encoding(self, image_size: int):
+        """
+        FixRes-style interpolation of the CLIP positional embedding.
+
+        The pretrained ViT-B/32 positional_embedding has shape (50, 768),
+        matching 224x224 input (7x7=49 patches + 1 CLS). When training at a
+        higher resolution (e.g. 384), we bicubically interpolate the 7x7 grid
+        of patch positions to the new grid (12x12=144), keeping the CLS token
+        position unchanged.
+        """
+        visual = self.visual
+        if not hasattr(visual, "positional_embedding"):
+            return
+        pos_embed = visual.positional_embedding.data
+        if pos_embed.dim() != 2 or pos_embed.shape[0] <= 1:
+            return
+
+        num_patches = pos_embed.shape[0] - 1
+        patch_size = visual.patch_size
+        if isinstance(patch_size, (tuple, list)):
+            patch_size = patch_size[0]
+        old_grid = int(round(num_patches ** 0.5))
+        new_grid = image_size // patch_size
+        if old_grid == new_grid:
+            return
+
+        dim = pos_embed.shape[-1]
+        cls_pos = pos_embed[0:1]  # (1, dim) CLS token position
+        patch_pos = pos_embed[1:]  # (old_grid^2, dim)
+
+        # Reshape to (1, dim, old_grid, old_grid) and bicubically interpolate
+        patch_pos = (
+            patch_pos.reshape(old_grid, old_grid, dim)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+        )
+        patch_pos = F.interpolate(
+            patch_pos,
+            size=(new_grid, new_grid),
+            mode="bicubic",
+            align_corners=False,
+        )
+        patch_pos = (
+            patch_pos.squeeze(0)
+            .permute(1, 2, 0)
+            .reshape(new_grid * new_grid, dim)
+        )
+
+        new_pos_embed = torch.cat([cls_pos, patch_pos], dim=0)  # (new_grid^2+1, dim)
+        visual.positional_embedding = nn.Parameter(new_pos_embed)
+        print(
+            f"[CLIPLoRA] Interpolated positional_embedding: "
+            f"{num_patches} -> {new_grid * new_grid} patches "
+            f"(grid {old_grid}x{old_grid} -> {new_grid}x{new_grid})"
+        )
 
     def _encode_class_names(self, class_names: list) -> torch.Tensor:
         """Encode class folder names to text features for zero-shot init."""

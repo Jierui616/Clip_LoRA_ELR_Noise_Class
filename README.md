@@ -1,5 +1,18 @@
 # CLIP + LoRA + ELR: 面向噪声标签数据的细粒度图像识别鲁棒微调
 
+<div align="center">
+
+[![GitHub Stars](https://img.shields.io/github/stars/Jierui616/Clip_LoRA_ELR_Noise_Class?style=flat-square&logo=github&color=ffd700)](https://github.com/Jierui616/Clip_LoRA_ELR_Noise_Class/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/Jierui616/Clip_LoRA_ELR_Noise_Class?style=flat-square&logo=github&color=63666E)](https://github.com/Jierui616/Clip_LoRA_ELR_Noise_Class/network/members)
+[![Last Commit](https://img.shields.io/github/last-commit/Jierui616/Clip_LoRA_ELR_Noise_Class?style=flat-square&logo=github&color=blue)](https://github.com/Jierui616/Clip_LoRA_ELR_Noise_Class/commits/main)
+[![Python 3.10](https://img.shields.io/badge/Python-3.10-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![PyTorch 2.x](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![CLIP ViT-B/32](https://img.shields.io/badge/Backbone-CLIP%20ViT--B%2F32-8A2BE2?style=flat-square)](https://github.com/mlfoundations/open_clip)
+[![Top-1 Acc](https://img.shields.io/badge/Top--1%20Acc-78.64%25-brightgreen?style=flat-square)]()
+[![License](https://img.shields.io/badge/License-Academic%20Use-blue?style=flat-square)]()
+
+</div>
+
 ```bash
 # 在 Ubuntu 终端（WSL）中激活 conda 环境
 conda activate clora

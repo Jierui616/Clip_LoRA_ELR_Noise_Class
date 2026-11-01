@@ -21,7 +21,7 @@ class ModelConfig:
     image_size: int = 224
 
     # --- LoRA ---
-    lora_r: int = 64  # LoRA rank (increased for fine-grained 500-class task)
+    lora_r: int = 64  # LoRA rank (increased for fine-grained 750-class task)
     lora_alpha: int = 64  # LoRA scaling factor
     lora_dropout: float = 0.1
     lora_target_modules: Tuple[str, ...] = (
@@ -31,9 +31,10 @@ class ModelConfig:
     # --- Classification head ---
     num_classes: int = 400  # Override per dataset
     classifier_dropout: float = 0.2
-    classifier_hidden_dim: int = 1024  # More capacity for fine-grained features
+    classifier_hidden_dim: int = 512  # 与 CLIP 特征维一致，使 cosine 头无投影、zero-shot 先验直接生效
     classifier_type: str = "cosine"  # cosine is more noise-robust
     zero_shot_init: bool = True  # Init classifier with CLIP text encoder (class names)
+    freeze_prototypes: bool = False  # 冻结 cosine 原型（仅学 logit_scale），噪声无法污染 CLIP 先验
 
     # --- Prompt Learning (CoOp-style) ---
     use_prompt_learner: bool = True  # Learnable text prompts for multimodal classification
@@ -71,6 +72,7 @@ class DataConfig:
     pin_memory: bool = True
     prefetch_factor: int = 2
     val_split: float = 0.1  # Fraction of training data for validation
+    use_balanced_sampler: bool = True  # 平衡采样缓解长尾（官方测试集为均匀分布）
 
 
 @dataclass
@@ -88,6 +90,18 @@ class LossConfig:
     loss_type: str = "elr+gce"  # Combine ELR and GCE for best noise robustness
     elr_weight: float = 1.0  # Weight for ELR term
     gce_weight: float = 0.3  # Weight for GCE term (lower to not dominate)
+
+    # --- Double-Softmax (DSPT) 与 DeFT ---
+    ds_weight: float = 1.0  # double-softmax 项权重（loss_type 含 "ds" 时生效）
+    deft_weight: float = 0.0  # DeFT 软标签融合权重（>0 启用，用 CLIP zero-shot 干净参考纠正噪声标签）
+    deft_temperature: float = 1.0  # zero-shot 软标签温度
+    deft_detect: bool = False  # DeFT 噪声检测：按硬标签的零样本支持度给样本级信任度，只强纠可疑样本
+
+    # --- GRIP 类软标签 ---
+    grip_enabled: bool = False  # 类软标签监督（GRIP 思路，用类级软分布替代 one-hot，减少噪声硬标签过拟合）
+    grip_alpha: float = 0.9  # 类软标签 EMA 更新系数（越大越慢）
+    grip_weight: float = 0.3  # 类软标签损失权重
+    grip_warmup: int = 5  # 类软标签起始 epoch
 
     # --- SupCon (Supervised Contrastive Learning) ---
     use_supcon: bool = True  # Enable supervised contrastive loss for better features
@@ -110,6 +124,10 @@ class LossConfig:
     use_co_teaching: bool = False  # Disabled: empirically hurts with ELR+cosine setup
     co_teach_forget_rate: float = 0.3
     co_teach_num_gradual: int = 10
+
+    # --- Semi-Supervised Loop (DivideMix-style, 噪声样本伪标签正则) ---
+    semi_supervised: bool = True  # 对 GMM 噪声子集，用 ELR target argmax 伪标签做自纠正 CE
+    semi_weight: float = 0.3  # 伪标签正则权重（增量，不改动硬标签主损失）
 
 
 @dataclass
@@ -146,6 +164,10 @@ class TrainConfig:
     distill_weight: float = 0.3  # Lower weight: let supervised loss dominate first
     ema_teacher_alpha: float = 0.999  # EMA momentum for teacher model
     ema_teacher_warmup: int = 200  # Longer warmup before distillation kicks in
+
+    # --- Honest Validation (验证诚实化) ---
+    honest_validation: bool = True  # 用 val EMA target 去噪参照标签评估，剥离噪声标签污染
+    honest_ema_beta: float = 0.9  # val EMA target 的平滑系数（越大越慢，越信早期信念）
 
     # --- Early stopping ---
     early_stopping_patience: int = 12  # ~30% of training, reasonable for noisy data
@@ -204,9 +226,9 @@ def get_config(dataset: str = "webfg400", **overrides) -> DefaultConfig:
 
     if dataset == "webfg400":
         cfg.dataset = "webfg400"
-        cfg.model.num_classes = 500  # Actual data has 500 classes
-        # 500 classes, ~103k train images, ~200 images/class
-        cfg.train.epochs = 40
+        cfg.model.num_classes = 750  # Actual data has 750 classes (复赛 B 榜)
+        # 750 classes, ~149k train images, ~200 images/class
+        cfg.train.epochs = 40  # 与 75.73% 基线一致；60 epoch + onecycle 曾导致调度破坏、退步约 11 分
         cfg.train.batch_size = 64
         cfg.train.gradient_accumulation_steps = 2  # Effective batch = 128
         cfg.loss.elr_lambda = 5.0

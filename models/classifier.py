@@ -31,6 +31,7 @@ class ClassificationHead(nn.Module):
         use_layer_norm: bool = True,
         classifier_type: str = "fc",
         zero_shot_weight: torch.Tensor = None,
+        freeze_prototypes: bool = False,
     ):
         super().__init__()
 
@@ -39,14 +40,18 @@ class ClassificationHead(nn.Module):
 
         if classifier_type == "cosine":
             # Cosine classifier: learnable class prototypes
+            # 当 hidden_dim == in_features 时不做投影，直接在 CLIP 特征空间做
+            # cosine 分类，这样 zero-shot 的 CLIP 文本原型才能直接注入（否则
+            # 经过随机投影会破坏语义结构，导致类别先验失效）。
+            use_projection = (hidden_dim > 0) and (hidden_dim != in_features)
             self.projection = nn.Sequential(
                 nn.Linear(in_features, hidden_dim),
                 nn.LayerNorm(hidden_dim),
                 nn.GELU(),
                 nn.Dropout(dropout),
-            ) if hidden_dim > 0 else nn.Identity()
+            ) if use_projection else nn.Identity()
 
-            self.projection_dim = hidden_dim if hidden_dim > 0 else in_features
+            self.projection_dim = hidden_dim if use_projection else in_features
 
             # Learnable class weight vectors (prototypes)
             self.weight = nn.Parameter(
@@ -69,6 +74,10 @@ class ClassificationHead(nn.Module):
                       f"from CLIP text encoder (zero-shot)")
             else:
                 nn.init.orthogonal_(self.weight)
+
+            # Save zero-shot prototypes as a frozen anchor (for drift regularization)
+            if zero_shot_weight is not None:
+                self.register_buffer("zero_shot_anchor", self.weight.data.clone())
 
             # Learnable scale (like CLIP's logit scale)
             self.logit_scale = nn.Parameter(
@@ -93,6 +102,11 @@ class ClassificationHead(nn.Module):
 
         # Initialize final layer with small weights for stable training
         self._init_weights()
+
+        # Optionally freeze prototypes so the CLIP text prior stays intact
+        if freeze_prototypes and classifier_type == "cosine":
+            self.weight.requires_grad_(False)
+            print("[Classifier] Prototypes frozen (only logit_scale learnable)")
 
     def _init_weights(self):
         for m in self.modules():

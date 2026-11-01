@@ -100,13 +100,15 @@ class ELRLoss(nn.Module):
             # Normalize detach predictions for stability
             y_pred_normalized = y_pred_detach / y_pred_detach.sum(dim=1, keepdim=True)
 
-            # Use CPU indices for CPU-resident target buffer
-            idx_cpu = indices.cpu()
-            self.target[idx_cpu] = (
-                self.beta * self.target[idx_cpu]
-                + (1 - self.beta) * y_pred_normalized.cpu()
+            # target buffer 已随 criterion 置于 GPU，就地更新避免 host↔device 同步
+            idx = indices.to(self.target.device)
+            self.target[idx] = (
+                self.beta * self.target[idx]
+                + (1 - self.beta) * y_pred_normalized.to(
+                    device=self.target.device, dtype=self.target.dtype
+                )
             )
-            self.update_count[idx_cpu] += 1
+            self.update_count[idx] += 1
 
         # --- Cross-entropy loss ---
         if is_soft:
@@ -119,7 +121,7 @@ class ELRLoss(nn.Module):
 
         # --- ELR regularization term ---
         # log(1 - <target, y_pred>), averaged over batch
-        target_pred = self.target[indices.cpu()].to(y_pred.device)  # (B, C)
+        target_pred = self.target[indices.to(self.target.device)].to(y_pred.device)  # (B, C)
         inner_prod = (target_pred * y_pred).sum(dim=1)  # (B,)
         elr_reg = torch.log(1.0 - inner_prod + 1e-8).mean()
 
@@ -130,7 +132,7 @@ class ELRLoss(nn.Module):
 
     def get_targets(self, indices: torch.Tensor) -> torch.Tensor:
         """Get the current EMA target for given sample indices."""
-        return self.target[indices.cpu()].to(indices.device)
+        return self.target[indices.to(self.target.device)].to(indices.device)
 
     def get_all_targets(self) -> torch.Tensor:
         """Get the full target matrix (N, C)."""

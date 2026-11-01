@@ -6,12 +6,15 @@ This dataset wraps standard image folders and returns (image, label, index).
 """
 
 import os
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional, Tuple, List, Callable
 
 import torch
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
+
+from .sampler import WeightedRandomSampler as CBWeightedSampler
 
 
 class IndexedImageDataset(Dataset):
@@ -85,7 +88,7 @@ class IndexedImageDataset(Dataset):
                     self.samples.append((str(img_path), class_idx))
 
         # Deduplicate (in case both .jpg and .JPG are matched)
-        self.samples = list(set(self.samples))
+        self.samples = sorted(set(self.samples))
 
     def _load_test_folder(self, extensions: Tuple[str, ...]) -> None:
         """Load flat-folder structure for test data."""
@@ -94,7 +97,7 @@ class IndexedImageDataset(Dataset):
                 self.samples.append((str(img_path), -1))  # -1 = unknown label
             for img_path in self.root.glob(f"*{ext.upper()}"):
                 self.samples.append((str(img_path), -1))
-        self.samples = list(set(self.samples))
+        self.samples = sorted(set(self.samples))
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -162,6 +165,34 @@ class IndexedImageDataset(Dataset):
         return noisy_indices, clean_indices
 
 
+def stratified_split(samples, val_split, seed=42):
+    """按类别分层拆分，返回 (train_idx, val_idx) 列表。
+
+    与原先的 random_split 不同：每类固定 val_split 比例（至少保留 1 个）作
+    held-out 验证，保证长尾尾部类也有「未参与训练」的验证样本，从而可做
+    类均衡的 honest 评估（与官方均衡测试集同分布）。
+
+    确定性：samples 由 IndexedImageDataset 生成时已 sorted 去重，本函数又对
+    每类内部 sorted 后 rng.shuffle，故给定相同 samples/val_split/seed 跨进程
+    结果一致，评估脚本可复现同一 split。
+    """
+    import random as _random
+
+    by_class = defaultdict(list)
+    for i, (_, lbl) in enumerate(samples):
+        by_class[lbl].append(i)
+
+    rng = _random.Random(seed)
+    train_idx, val_idx = [], []
+    for lbl in sorted(by_class.keys()):
+        idxs = sorted(by_class[lbl])  # 稳定顺序，跨进程可复现
+        rng.shuffle(idxs)
+        n_val = max(1, int(round(len(idxs) * val_split)))
+        val_idx.extend(idxs[:n_val])
+        train_idx.extend(idxs[n_val:])
+    return train_idx, val_idx
+
+
 def get_dataloaders(
     train_root: str,
     test_root: str,
@@ -172,6 +203,7 @@ def get_dataloaders(
     pin_memory: bool = True,
     prefetch_factor: int = 2,
     val_split: float = 0.1,
+    use_balanced_sampler: bool = False,
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader,
            IndexedImageDataset, torch.utils.data.DataLoader]:
     """
@@ -195,16 +227,15 @@ def get_dataloaders(
         is_train=False,
     )
 
-    # Create train/val split from labeled training data
+    # Create train/val split from labeled training data (stratified held-out)
     num_train = len(train_dataset)
-    num_val = max(1, int(num_train * val_split))
-    num_train_final = num_train - num_val
-
-    train_subset, val_subset = torch.utils.data.random_split(
-        train_dataset,
-        [num_train_final, num_val],
-        generator=torch.Generator().manual_seed(42),
+    train_idx, val_idx = stratified_split(
+        train_dataset.samples, val_split=val_split, seed=42
     )
+    num_val = len(val_idx)
+    num_train_final = len(train_idx)
+
+    train_subset = Subset(train_dataset, train_idx)
 
     # CRITICAL: Create a separate val dataset with test transforms (no augmentation)
     # The val subset shares indices with train_dataset, but needs clean transforms
@@ -213,18 +244,42 @@ def get_dataloaders(
         transform=test_transform,
         is_train=True,
     )
-    # Override val_subset to use val_dataset as underlying data
-    val_subset.dataset = val_dataset
+    val_subset = Subset(val_dataset, val_idx)
 
-    train_loader = torch.utils.data.DataLoader(
-        train_subset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        prefetch_factor=prefetch_factor,
-        drop_last=True,
-    )
+    if use_balanced_sampler:
+        # 平衡采样：按有效样本数（Class-Balanced, Cui et al. CVPR 2019）过采样尾部类，
+        # 缓解长尾训练集与官方均匀测试集之间的分布漂移。
+        # train_subset.indices 保持原数据集索引，labels 语义与 ELR 的样本级 index 对齐。
+        labels = [train_dataset.samples[i][1] for i in train_subset.indices]
+        weights = CBWeightedSampler.compute_weights(
+            labels, num_classes=len(train_dataset.classes)
+        )
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=weights,
+            num_samples=len(train_subset),
+            replacement=True,
+        )
+        train_loader = torch.utils.data.DataLoader(
+            train_subset,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor,
+            drop_last=True,
+        )
+        print(f"  Balanced sampling enabled: WeightedRandomSampler "
+              f"(Class-Balanced beta=0.9999, {len(train_subset)} samples/epoch)")
+    else:
+        train_loader = torch.utils.data.DataLoader(
+            train_subset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor,
+            drop_last=True,
+        )
 
     val_loader = torch.utils.data.DataLoader(
         val_subset,

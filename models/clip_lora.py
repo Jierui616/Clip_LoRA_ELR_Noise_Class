@@ -68,6 +68,7 @@ class CLIPLoRAModel(nn.Module):
         prompt_fusion_weight: float = 0.3,
         zero_shot_init: bool = False,
         class_names: list = None,
+        freeze_prototypes: bool = False,
     ):
         super().__init__()
 
@@ -149,6 +150,7 @@ class CLIPLoRAModel(nn.Module):
             dropout=classifier_dropout,
             classifier_type=classifier_type,
             zero_shot_weight=text_prototypes,
+            freeze_prototypes=freeze_prototypes,
         )
 
         # Prompt learner (CoOp-style) for text-guided classification

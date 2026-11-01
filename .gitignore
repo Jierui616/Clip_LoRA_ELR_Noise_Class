@@ -10,3 +10,14 @@ __pycache__/
 *.pyc
 .idea/
 .vscode/
+.claude/
+
+# 临时调试脚本
+_*.py
+
+# 预测结果与日志
+pred_results*.csv
+*.log
+
+# 提交打包
+submit/

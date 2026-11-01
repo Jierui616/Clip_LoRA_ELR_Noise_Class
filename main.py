@@ -149,6 +149,7 @@ def main():
         pin_memory=cfg.data.pin_memory,
         prefetch_factor=cfg.data.prefetch_factor,
         val_split=getattr(cfg.data, 'val_split', 0.1),  # 10% for validation
+        use_balanced_sampler=getattr(cfg.data, 'use_balanced_sampler', False),
     )
 
     # Replace default collate with MixUp/CutMix collator for stronger augmentation
@@ -187,6 +188,7 @@ def main():
         classifier_dropout=cfg.model.classifier_dropout,
         classifier_type=getattr(cfg.model, 'classifier_type', 'fc'),
         freeze_backbone=cfg.model.freeze_backbone,
+        freeze_prototypes=cfg.model.freeze_prototypes,
         use_prompt_learner=cfg.model.use_prompt_learner,
         prompt_n_ctx=cfg.model.prompt_n_ctx,
         prompt_fusion_weight=cfg.model.prompt_fusion_weight,
@@ -215,6 +217,15 @@ def main():
         print(f"  ELR: λ={cfg.loss.elr_lambda}, β={cfg.loss.elr_beta}")
     if "gce" in cfg.loss.loss_type:
         print(f"  GCE: q={cfg.loss.gce_q}")
+    if "ds" in cfg.loss.loss_type:
+        print(f"  Double-Softmax (DSPT): weight={cfg.loss.ds_weight}")
+    if cfg.loss.deft_weight > 0:
+        print(f"  DeFT soft-label fusion: weight={cfg.loss.deft_weight}, T={cfg.loss.deft_temperature}")
+        if getattr(cfg.loss, 'deft_detect', False):
+            print(f"  DeFT noise detection: enabled (trust-gated soft labels)")
+    if getattr(cfg.loss, 'grip_enabled', False):
+        print(f"  GRIP class soft-label: weight={cfg.loss.grip_weight}, "
+              f"alpha={cfg.loss.grip_alpha}, warmup={cfg.loss.grip_warmup}")
     if cfg.loss.use_supcon:
         print(f"  SupCon: weight={cfg.loss.supcon_weight}, "
               f"temp={cfg.loss.supcon_temperature}")

@@ -74,6 +74,9 @@ class Trainer:
             "cuda" if torch.cuda.is_available() else "cpu"
         )
         self.model = self.model.to(self.device)
+        # 将 criterion（含 ELR 的 target buffer）移到 GPU，消除每 batch 的
+        # GPU↔CPU 同步（ELR target 原来在 CPU，每次 forward/get_targets 都触发同步）。
+        self.criterion = self.criterion.to(self.device)
 
         # Optimizer
         self.optimizer = self._build_optimizer()
@@ -217,6 +220,15 @@ class Trainer:
         self.train_losses = []
         self.val_accs = []
 
+        # --- GRIP 类软标签 ---
+        # 类级软分布矩阵 (C, C)，初始为单位阵（即初始等价于 one-hot 硬标签）。
+        # 训练中每 epoch 用 ELR target 的类内平均更新它，逐渐用类软标签替代硬标签。
+        self.class_soft = None
+        if getattr(config.loss, 'grip_enabled', False):
+            self.class_soft = torch.eye(
+                config.model.num_classes, device=self.device
+            )
+
         # Logger
         self.writer = None
         if config.use_wandb:
@@ -239,6 +251,33 @@ class Trainer:
             self.tb_writer = SummaryWriter(self.log_dir)
         except ImportError:
             self.tb_writer = None
+
+        # --- Honest validation (验证诚实化) ---
+        # 维护验证集每个样本的去噪 EMA soft target，argmax 作为"诚实参照标签"，
+        # 剥离含噪标签对 early stopping / model selection 的污染。
+        self.honest_validation = getattr(
+            config.train, 'honest_validation', False
+        )
+        self.honest_ema_beta = getattr(config.train, 'honest_ema_beta', 0.9)
+        if self.honest_validation:
+            # val_loader.dataset 是 random_split 的 Subset：.indices 为全局索引，
+            # .dataset 为 IndexedImageDataset（samples 顺序与 train_dataset 同序，
+            # 同进程内 set 去重 hash 一致）。
+            val_ds = val_loader.dataset
+            val_indices = val_ds.indices
+            val_labels = [val_ds.dataset.samples[i][1] for i in val_indices]
+            self.val_ema_target = torch.zeros(
+                len(val_indices), config.model.num_classes
+            )
+            self.val_ema_target[
+                torch.arange(len(val_indices)),
+                torch.tensor(val_labels, dtype=torch.long),
+            ] = 1.0
+            print(f"[Trainer] Honest validation enabled "
+                  f"(val EMA target size={len(val_indices)}, "
+                  f"beta={self.honest_ema_beta})")
+        else:
+            self.val_ema_target = None
 
     def _build_optimizer(self):
         """Build optimizer with per-parameter learning rates."""
@@ -352,7 +391,7 @@ class Trainer:
             # Full GMM update at epoch level (after worst samples stabilized)
             if self.use_gmm and epoch >= self.config.loss.gmm_warmup_epochs:
                 if hasattr(self.criterion, 'elr') and self.criterion.elr is not None:
-                    all_targets = self.criterion.elr.get_all_targets()
+                    all_targets = self.criterion.elr.get_all_targets().cpu()  # sklearn 需 CPU
                     # Use full_train_dataset (not subset) to get all labels
                     ds = self.full_train_dataset if self.full_train_dataset is not None else self.train_loader.dataset
                     all_labels = torch.tensor(
@@ -364,15 +403,53 @@ class Trainer:
                           f"means=[{stats['gmm_mean_clean']:.4f}, "
                           f"{stats['gmm_mean_noisy']:.4f}]")
 
+            # GRIP 类软标签更新（每 epoch 末，用 ELR target 类平均）
+            if (self.config.loss.grip_enabled
+                    and epoch >= self.config.loss.grip_warmup
+                    and hasattr(self.criterion, 'elr')
+                    and self.criterion.elr is not None):
+                all_targets = self.criterion.elr.get_all_targets().cpu()  # (N, C) CPU
+                ds = (self.full_train_dataset
+                      if self.full_train_dataset is not None
+                      else self.train_loader.dataset)
+                all_labels = torch.tensor(
+                    [ds.samples[i][1] for i in range(len(ds))]
+                )
+                self._update_class_soft(all_targets, all_labels)
+
             # Evaluate
             if (epoch + 1) % self.config.eval_interval == 0:
-                val_results = self.evaluator.evaluate(
-                    self.val_loader,
-                    num_classes=self.config.model.num_classes,
-                    desc=f"Val Epoch {epoch + 1}",
-                )
-                val_acc = val_results["top1_acc"]
-                self.val_accs.append(val_acc)
+                if self.honest_validation:
+                    hv = self._honest_validate()
+                    val_acc = hv["honest_acc"]  # 用诚实 acc 做 model selection
+                    self.val_accs.append(val_acc)
+                    log_str = (
+                        f"Epoch {epoch + 1:3d}/{cfg.epochs} | "
+                        f"Loss: {train_loss:.4f} | "
+                        f"Val Acc (honest): {hv['honest_acc'] * 100:.2f}% | "
+                        f"raw: {hv['raw_acc'] * 100:.2f}%"
+                    )
+                    print(log_str)
+                else:
+                    val_results = self.evaluator.evaluate(
+                        self.val_loader,
+                        num_classes=self.config.model.num_classes,
+                        desc=f"Val Epoch {epoch + 1}",
+                    )
+                    val_acc = val_results["top1_acc"]
+                    self.val_accs.append(val_acc)
+                    log_str = (
+                        f"Epoch {epoch + 1:3d}/{cfg.epochs} | "
+                        f"Loss: {train_loss:.4f} | "
+                        f"Val Acc: {val_acc * 100:.2f}%"
+                    )
+                    if "top5_acc" in val_results:
+                        log_str += f" | Top-5: {val_results['top5_acc'] * 100:.2f}%"
+                    if "mean_per_class_acc" in val_results:
+                        log_str += (
+                            f" | Mean-PC: {val_results['mean_per_class_acc'] * 100:.2f}%"
+                        )
+                    print(log_str)
 
                 # SWA update (average model weights over late training)
                 if epoch >= self.swa_start_epoch:
@@ -389,20 +466,6 @@ class Trainer:
                             swa_param.data = (
                                 self.swa_count * swa_param.data + model_param.data
                             ) / (self.swa_count + 1)
-
-                # Logging
-                log_str = (
-                    f"Epoch {epoch + 1:3d}/{cfg.epochs} | "
-                    f"Loss: {train_loss:.4f} | "
-                    f"Val Acc: {val_acc * 100:.2f}%"
-                )
-                if "top5_acc" in val_results:
-                    log_str += f" | Top-5: {val_results['top5_acc'] * 100:.2f}%"
-                if "mean_per_class_acc" in val_results:
-                    log_str += (
-                        f" | Mean-PC: {val_results['mean_per_class_acc'] * 100:.2f}%"
-                    )
-                print(log_str)
 
                 # TensorBoard
                 if self.tb_writer:
@@ -509,6 +572,51 @@ class Trainer:
             "val_accs": self.val_accs,
         }
 
+    @torch.no_grad()
+    def _honest_validate(self) -> Dict[str, float]:
+        """
+        Honest validation: 用去噪后的 EMA target 作参照标签评估，而非原始含噪标签。
+
+        每个验证样本维护一个 soft EMA target（初始化为原始标签 one-hot），
+        每轮验证用模型 softmax 结果平滑更新。其 argmax 反映模型"早期 + 稳定"
+        的信念（对噪声样本更可能正确，符合 ELR 的 early-learning 假设）。
+
+        honest_acc = 最终预测 == argmax(EMA target)，衡量模型对噪声记忆的
+        抵抗力，是比含噪验证 acc 更接近干净测试性能的代理。
+
+        Returns:
+            {"honest_acc": ..., "raw_acc": ...}
+        """
+        self.model.eval()
+        beta = self.honest_ema_beta
+        correct_raw = 0
+        correct_honest = 0
+        total = 0
+        offset = 0
+        for images, labels, _ in self.val_loader:
+            images = images.to(self.device)
+            labels = labels.to(self.device)
+            b = images.size(0)
+            with torch.amp.autocast("cuda", enabled=self.use_amp):
+                logits = self.model(images)
+            preds = logits.argmax(dim=1)
+            probs = F.softmax(logits, dim=1)
+
+            # EMA 更新去噪参照标签（按 val 局部顺序对齐）
+            tgt = self.val_ema_target[offset:offset + b].to(self.device)
+            tgt = beta * tgt + (1 - beta) * probs
+            self.val_ema_target[offset:offset + b] = tgt.cpu()
+
+            correct_raw += (preds == labels).sum().item()
+            correct_honest += (preds == tgt.argmax(dim=1)).sum().item()
+            total += b
+            offset += b
+
+        return {
+            "honest_acc": correct_honest / total if total else 0.0,
+            "raw_acc": correct_raw / total if total else 0.0,
+        }
+
     def _train_epoch(self, epoch: int) -> float:
         """Train for one epoch. Returns average loss."""
         self.model.train()
@@ -568,6 +676,54 @@ class Trainer:
 
                 # --- Main loss (ELR / GCE / Combined) ---
                 loss = self._compute_main_loss(indices, logits, labels, features)
+
+                # --- Semi-supervised: 噪声样本用 ELR target argmax 伪标签自纠正 ---
+                # GMM 判定的噪声子集不再"硬扛"含噪标签，额外用 ELR 的 EMA target
+                # 的 argmax 作伪标签拉向模型早期稳定信念（增量正则，不改主损失）。
+                if (self.config.loss.semi_supervised and clean_mask is not None
+                        and hasattr(self.criterion, 'elr')
+                        and self.criterion.elr is not None):
+                    noisy_mask = ~clean_mask
+                    if noisy_mask.any():
+                        elr_tgt = self.criterion.elr.get_targets(indices)
+                        pseudo_labels = elr_tgt.argmax(dim=1)
+                        semi_loss = F.cross_entropy(
+                            logits[noisy_mask], pseudo_labels[noisy_mask]
+                        )
+                        loss = loss + self.config.loss.semi_weight * semi_loss
+
+                # --- DeFT 软标签融合：用 CLIP zero-shot 干净参考纠正噪声标签 ---
+                # 视觉特征与冻结的零样本文本原型算"干净 logits"，作为软标签监督，
+                # 剥离含噪硬标签对模型的污染（DeFT 核心思想）。
+                if self.config.loss.deft_weight > 0 and not is_soft:
+                    zs_anchor = getattr(self.model.classifier, "zero_shot_anchor", None)
+                    if zs_anchor is not None and zs_anchor.numel() > 0:
+                        zs_logits = (
+                            features @ zs_anchor.T
+                            * self.model.classifier.logit_scale.detach()
+                        )
+                        p_zs = F.softmax(
+                            zs_logits / self.config.loss.deft_temperature, dim=1
+                        ).detach()
+                        log_probs = F.log_softmax(logits, dim=1)
+                        if getattr(self.config.loss, 'deft_detect', False):
+                            # 噪声检测：硬标签相对零样本 top-1 的支持度作为信任度
+                            p_zs_at_label = p_zs.gather(1, labels.unsqueeze(1)).squeeze(1)
+                            p_zs_max = p_zs.max(dim=1).values
+                            trust = p_zs_at_label / (p_zs_max + 1e-7)  # (B,) 0~1
+                            # 可疑样本(trust 低)强加零样本软标签；干净样本(trust 高)几乎不加
+                            deft_loss = -((1 - trust) * (p_zs * log_probs).sum(dim=1)).mean()
+                        else:
+                            deft_loss = -(p_zs * log_probs).sum(dim=1).mean()
+                        loss = loss + self.config.loss.deft_weight * deft_loss
+
+                # --- GRIP 类软标签：用类级软分布替代 one-hot，减少噪声硬标签过拟合 ---
+                if (self.config.loss.grip_enabled and not is_soft
+                        and epoch >= self.config.loss.grip_warmup):
+                    soft_cls = self.class_soft[labels]  # (B, C)
+                    grip_log_probs = F.log_softmax(logits, dim=1)
+                    grip_loss = -(soft_cls * grip_log_probs).sum(dim=1).mean()
+                    loss = loss + self.config.loss.grip_weight * grip_loss
 
                 # --- Label refinement ---
                 if self.use_label_refine and self.refiner and not is_soft:
@@ -665,6 +821,23 @@ class Trainer:
                     )
 
         return total_loss / max(num_batches, 1)
+
+    def _update_class_soft(self, all_targets: torch.Tensor, all_labels: torch.Tensor):
+        """
+        GRIP 类软标签更新：用 ELR target 的类内平均得到类级软分布，
+        再与历史类软标签做 EMA 融合。类软标签能平滑单样本噪声标签，
+        减少噪声硬标签对类原型的过拟合。
+        """
+        num_classes = self.class_soft.shape[0]
+        onehot = F.one_hot(all_labels, num_classes).float()  # (N, C) CPU
+        cls_sum = onehot.T @ all_targets.float()  # (C, C) CPU 类内 ELR target 之和
+        cls_cnt = onehot.sum(dim=0)  # (C,) 每类样本数
+        class_soft_new = cls_sum / (cls_cnt.unsqueeze(1) + 1e-6)  # (C, C)
+        alpha = self.config.loss.grip_alpha
+        self.class_soft = (
+            alpha * self.class_soft
+            + (1 - alpha) * class_soft_new.to(self.class_soft.device)
+        )
 
     def _train_epoch_coteach(self, epoch: int) -> float:
         """Co-Teaching epoch: two models select clean samples for each other."""
@@ -801,12 +974,16 @@ class Trainer:
 
         # Save ELR targets
         if hasattr(self.criterion, "elr") and self.criterion.elr is not None:
-            checkpoint["elr_targets"] = self.criterion.elr.get_all_targets()
+            checkpoint["elr_targets"] = self.criterion.elr.get_all_targets().cpu()
 
         # Save GMM state
         if self.sample_selector:
             checkpoint["loss_history"] = self.sample_selector.loss_history
             checkpoint["loss_count"] = self.sample_selector.loss_count
+
+        # Save GRIP class soft labels
+        if self.class_soft is not None:
+            checkpoint["class_soft"] = self.class_soft.cpu()
 
         path = self.output_dir / filename
         torch.save(checkpoint, path)
@@ -835,12 +1012,21 @@ class Trainer:
         # Restore ELR targets
         if "elr_targets" in checkpoint and hasattr(self.criterion, "elr"):
             if self.criterion.elr is not None:
-                self.criterion.elr.target.copy_(checkpoint["elr_targets"])
+                self.criterion.elr.target.copy_(
+                    checkpoint["elr_targets"].to(
+                        device=self.criterion.elr.target.device,
+                        dtype=self.criterion.elr.target.dtype,
+                    )
+                )
 
         # Restore GMM state (keep on CPU for sklearn compatibility)
         if "loss_history" in checkpoint and self.sample_selector:
             self.sample_selector.loss_history = checkpoint["loss_history"].cpu()
             self.sample_selector.loss_count = checkpoint["loss_count"].cpu()
+
+        # Restore GRIP class soft labels
+        if "class_soft" in checkpoint and self.class_soft is not None:
+            self.class_soft = checkpoint["class_soft"].to(self.class_soft.device)
 
         print(f"  Resumed from epoch {self.current_epoch}")
 

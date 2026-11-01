@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from .elr import ELRLoss
 from .gce import GCELoss, TruncatedGCELoss
+from .double_softmax import DoubleSoftmaxLoss
 
 
 class CombinedLoss(nn.Module):
@@ -41,6 +42,8 @@ class CombinedLoss(nn.Module):
         gce_weight: float = 0.5,
         gce_truncated: bool = False,
         gce_threshold: float = 0.1,
+        # Double-softmax (DSPT)
+        ds_weight: float = 1.0,
         # Self-distillation
         use_distill: bool = False,
         distill_temperature: float = 4.0,
@@ -57,10 +60,12 @@ class CombinedLoss(nn.Module):
         self.label_smoothing = label_smoothing
         self.elr_weight = elr_weight
         self.gce_weight = gce_weight
+        self.ds_weight = ds_weight
 
         # Initialize sub-losses
         self.elr = None
         self.gce = None
+        self.ds = None
 
         if "elr" in loss_type:
             self.elr = ELRLoss(
@@ -82,6 +87,9 @@ class CombinedLoss(nn.Module):
                     q=gce_q,
                     num_classes=num_classes,
                 )
+
+        if "ds" in loss_type or "dsp" in loss_type:
+            self.ds = DoubleSoftmaxLoss(num_classes=num_classes)
 
     def forward(
         self,
@@ -128,8 +136,13 @@ class CombinedLoss(nn.Module):
                 gce_loss = self.gce(outputs, labels)
             total_loss = total_loss + self.gce_weight * gce_loss
 
+        # --- Double-Softmax loss (DSPT) ---
+        if self.ds is not None:
+            ds_loss = self.ds(outputs, labels)
+            total_loss = total_loss + self.ds_weight * ds_loss
+
         # --- Plain cross-entropy fallback ---
-        if self.elr is None and self.gce is None:
+        if self.elr is None and self.gce is None and self.ds is None:
             if is_soft:
                 probs = F.softmax(outputs, dim=1)
                 probs = torch.clamp(probs, 1e-7, 1.0 - 1e-7)

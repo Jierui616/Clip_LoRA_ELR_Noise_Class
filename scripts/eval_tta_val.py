@@ -26,12 +26,13 @@ from models import CLIPLoRAModel
 from trainers.evaluator import Evaluator
 
 
-def build_model(checkpoint, pretrained_path, num_classes, device):
+def build_model(checkpoint, pretrained_path, num_classes, device, image_size=224):
     config = checkpoint.get("config", None)
     if config is not None:
         cm = config.model
         return CLIPLoRAModel(
             num_classes=num_classes,
+            image_size=image_size,
             pretrained=pretrained_path,
             lora_r=cm.lora_r,
             lora_alpha=cm.lora_alpha,
@@ -45,7 +46,7 @@ def build_model(checkpoint, pretrained_path, num_classes, device):
             prompt_fusion_weight=cm.prompt_fusion_weight,
         ).to(device)
     return CLIPLoRAModel(
-        num_classes=num_classes, pretrained=pretrained_path
+        num_classes=num_classes, image_size=image_size, pretrained=pretrained_path
     ).to(device)
 
 
@@ -55,20 +56,26 @@ def main():
     parser.add_argument("--data_root", default="./data")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--image_size", type=int, default=224)
+    parser.add_argument("--use_ema", action="store_true", help="Use EMA teacher weights")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    num_classes = 500
+    num_classes = 750
     pretrained_path = f"{args.data_root}/ViT-B-32_openai.bin"
     if not Path(pretrained_path).exists():
         pretrained_path = "openai"
 
     print("Loading checkpoint...")
     checkpoint = torch.load(args.resume, map_location=device)
-    model = build_model(checkpoint, pretrained_path, num_classes, device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model = build_model(checkpoint, pretrained_path, num_classes, device, image_size=args.image_size)
+    model.load_state_dict(
+        checkpoint["ema_teacher"]["shadow_state_dict"]
+        if args.use_ema and "ema_teacher" in checkpoint
+        else checkpoint["model_state_dict"]
+    )
+    print("Using EMA teacher weights" if args.use_ema else "Using student weights")
     model.eval()
     print(f"Loaded {args.resume}")
 
@@ -77,7 +84,7 @@ def main():
 
     # TTA val loader (multi-scale + flip transform) with the exact val split
     train_transform = get_train_transforms(image_size=args.image_size)
-    tta_transform = get_test_transforms(image_size=args.image_size, is_tta=True)
+    tta_transform = get_test_transforms(image_size=args.image_size, crop_size=args.image_size, is_tta=True)
     _, _, _, val_loader = get_dataloaders(
         train_root=train_root,
         test_root=test_root,
